@@ -1,0 +1,113 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: auctav-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    networks:
+      - auctav-internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  app1:
+    build: .
+    image: auctav-server:latest
+    container_name: auctav-app1
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=production
+      - PORT=9022
+      - INSTANCE_ID=app1
+      - REDIS_URL=redis://redis:6379
+    networks:
+      - auctav-internal
+      - traefik-public
+    labels: &auctav-labels
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik-public"
+
+      # --- Router ---
+      - "traefik.http.routers.auctav-socket.rule=Host(`socket-auctav.astucom.com`)"
+      - "traefik.http.routers.auctav-socket.entrypoints=websecure"
+      - "traefik.http.routers.auctav-socket.tls.certresolver=letsencrypt"
+
+      # --- Service / Load balancer ---
+      - "traefik.http.services.auctav-socket.loadbalancer.server.port=9022"
+
+      # --- Sticky session — OBLIGATOIRE pour Socket.IO (polling) ---
+      - "traefik.http.services.auctav-socket.loadbalancer.sticky.cookie=true"
+      - "traefik.http.services.auctav-socket.loadbalancer.sticky.cookie.name=SERVERID"
+      - "traefik.http.services.auctav-socket.loadbalancer.sticky.cookie.httpOnly=true"
+      - "traefik.http.services.auctav-socket.loadbalancer.sticky.cookie.secure=true"
+      - "traefik.http.services.auctav-socket.loadbalancer.sticky.cookie.samesite=lax"
+
+  app2:
+    build: .
+    image: auctav-server:latest
+    container_name: auctav-app2
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=production
+      - PORT=9022
+      - INSTANCE_ID=app2
+      - REDIS_URL=redis://redis:6379
+    networks:
+      - auctav-internal
+      - traefik-public
+    labels: *auctav-labels
+
+  app3:
+    build: .
+    image: auctav-server:latest
+    container_name: auctav-app3
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=production
+      - PORT=9022
+      - INSTANCE_ID=app3
+      - REDIS_URL=redis://redis:6379
+    networks:
+      - auctav-internal
+      - traefik-public
+    labels: *auctav-labels
+
+  app4:
+    build: .
+    image: auctav-server:latest
+    container_name: auctav-app4
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=production
+      - PORT=9022
+      - INSTANCE_ID=app4
+      - REDIS_URL=redis://redis:6379
+    networks:
+      - auctav-internal
+      - traefik-public
+    labels: *auctav-labels
+
+networks:
+  auctav-internal:
+    driver: bridge
+  traefik-public:
+    external: true
+
+volumes:
+  redis-data:
