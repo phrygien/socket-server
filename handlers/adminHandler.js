@@ -11,7 +11,22 @@
 //   celle déjà présente dans roomHandler.js (event 'joinroom'), qui couvre
 //   le cas le plus fréquent (admin → joinroom).
 //
-const socketMeta = require("../store");
+// Adaptation clustering (Redis store) :
+//   store.get() retourne un objet désérialisé à chaque appel — le muter
+//   localement (meta.pseudo = ..., meta.isAdmin = ...) n'a aucun effet sur
+//   Redis. La mutation est désormais persistée explicitement via
+//   store.set(socketId, meta) une fois toutes les modifications faites.
+//
+//   NOTE clustering (identique à evictStaleAdmin dans roomHandler.js) :
+//   io.sockets.sockets.get(existingAdminId) ne trouve que les sockets
+//   connectées à CETTE instance. Si l'ancien admin est sur une autre
+//   instance (app2 alors qu'on traite l'event sur app1), on tombera dans la
+//   branche "fantôme" et on supprimera juste son entrée store, sans fermer
+//   sa vraie connexion. Cas rare avec sticky sessions, mais possible après
+//   un redéploiement/restart d'instance — voir la note équivalente dans
+//   roomHandler.js pour l'amélioration possible (Pub/Sub ciblé).
+
+const store = require("../store");
 const { log } = require("../utils/logger");
 const {
   broadcastUserList,
@@ -23,8 +38,8 @@ function registerAdminHandler(io, socket) {
    * Identification de l'admin — émis avant joinroom.
    * socket.emit('admin', pseudo)
    */
-  socket.on("admin", (pseudo) => {
-    const meta = socketMeta.get(socket.id);
+  socket.on("admin", async (pseudo) => {
+    const meta = await store.get(socket.id);
 
     if (meta) {
       meta.pseudo = pseudo || "Admin";
@@ -34,11 +49,9 @@ function registerAdminHandler(io, socket) {
       // émis après 'joinroom'), s'assurer qu'aucun autre socket n'est
       // encore marqué admin sur cette même room.
       if (meta.room) {
-        const existingAdminId = getAdminOfRoom(meta.room);
-
+        const existingAdminId = await getAdminOfRoom(meta.room);
         if (existingAdminId && existingAdminId !== socket.id) {
           const oldSocket = io.sockets.sockets.get(existingAdminId);
-
           if (oldSocket) {
             log(
               `  [ADMIN REPLACE] (via 'admin' event) ancien admin=${existingAdminId} expulsé de room="${meta.room}" (remplacé par ${socket.id})`,
@@ -46,18 +59,20 @@ function registerAdminHandler(io, socket) {
             oldSocket.disconnect(true); // ferme proprement → déclenche disconnectHandler
           } else {
             log(
-              `  [ADMIN REPLACE] (via 'admin' event) ancien admin=${existingAdminId} déjà fantôme, nettoyage direct du store`,
+              `  [ADMIN REPLACE] (via 'admin' event) ancien admin=${existingAdminId} déjà fantôme (ou sur une autre instance), nettoyage direct du store`,
             );
-            socketMeta.delete(existingAdminId);
+            await store.delete(existingAdminId);
           }
         }
       }
+
+      await store.set(socket.id, meta);
     }
 
     log(`  [admin]    : ${socket.id} → "${pseudo}"`);
 
     // Si l'admin était déjà dans une salle (reconnexion rapide), notifier
-    if (meta?.room) broadcastUserList(io, meta.room);
+    if (meta?.room) await broadcastUserList(io, meta.room);
   });
 }
 

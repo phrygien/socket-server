@@ -20,11 +20,17 @@
 //                     → relayé à toute la salle (l'admin écoute et répond)
 //   - 'numLot'      : déjà géré par getMsgRoom dans roomHandler
 //   - 'previousLot' : déjà géré par getMsgRoom dans roomHandler
+//
+// Adaptation clustering (Redis store) :
+//   store.get()/entries() sont désormais asynchrones (Redis au lieu d'un
+//   Map local) — tous les handlers et fonctions consommant le store
+//   deviennent async. Aucune mutation de meta n'était faite ici (lecture
+//   seule), donc pas de risque de perte d'état comme dans roomHandler.
 
-const socketMeta = require('../store');
-const { log }    = require('../utils/logger');
+const store = require("../store");
+const { log } = require("../utils/logger");
 
-const SCREEN_ROOM = 'auctav_screen';
+const SCREEN_ROOM = "auctav_screen";
 
 function registerScreenHandler(io, socket) {
   /**
@@ -35,18 +41,18 @@ function registerScreenHandler(io, socket) {
    *
    * Ici on gère le cas où 'getScreen' est émis en broadcast à la salle.
    */
-  socket.on('getScreen', (data) => {
-    const meta = socketMeta.get(socket.id);
+  socket.on("getScreen", async (data) => {
+    const meta = await store.get(socket.id);
     const room = meta?.room;
     if (!room) return;
 
     log(`  [getScreen]: ${socket.id} "${meta?.pseudo}" → ${room}`);
 
-    io.to(room).emit('sendMsg', {
-      type : 'getScreen',
-      msg  : data || {},
-      name : meta?.pseudo || 'unknown',
-      from : socket.id
+    io.to(room).emit("sendMsg", {
+      type: "getScreen",
+      msg: data || {},
+      name: meta?.pseudo || "unknown",
+      from: socket.id,
     });
   });
 
@@ -58,18 +64,18 @@ function registerScreenHandler(io, socket) {
    * Ce handler permet à un client non-admin (ex: régie) d'émettre
    * directement un 'numLot' sans passer par getMsgRoom.
    */
-  socket.on('numLot', (data) => {
-    const meta = socketMeta.get(socket.id);
+  socket.on("numLot", async (data) => {
+    const meta = await store.get(socket.id);
     const room = meta?.room;
     if (!room) return;
 
     log(`  [numLot]   : ${socket.id} lot=${data?.numLot} → ${room}`);
 
-    io.to(room).emit('sendMsg', {
-      type : 'numLot',
-      msg  : data || {},
-      name : meta?.pseudo || 'unknown',
-      from : socket.id
+    io.to(room).emit("sendMsg", {
+      type: "numLot",
+      msg: data || {},
+      name: meta?.pseudo || "unknown",
+      from: socket.id,
     });
   });
 
@@ -77,37 +83,41 @@ function registerScreenHandler(io, socket) {
    * Affichage du lot précédent (prix adjugé).
    * Idem : complément au flux getMsgRoom de roomHandler.
    */
-  socket.on('previousLot', (data) => {
-    const meta = socketMeta.get(socket.id);
+  socket.on("previousLot", async (data) => {
+    const meta = await store.get(socket.id);
     const room = meta?.room;
     if (!room) return;
 
     log(`  [prevLot]  : ${socket.id} lot=${data?.numLot} → ${room}`);
 
-    io.to(room).emit('sendMsg', {
-      type : 'previousLot',
-      msg  : data || {},
-      name : meta?.pseudo || 'unknown',
-      from : socket.id
+    io.to(room).emit("sendMsg", {
+      type: "previousLot",
+      msg: data || {},
+      name: meta?.pseudo || "unknown",
+      from: socket.id,
     });
   });
 }
 
 /**
- * Retourne les écrans connectés dans la salle screen.
+ * Retourne les écrans connectés dans la salle screen
+ * (toutes instances confondues, grâce au store Redis partagé).
  * Utilisé par l'endpoint REST GET /screen/:room
  */
-function getScreensInRoom(room) {
+async function getScreensInRoom(room) {
+  const entries = await store.entries();
   const screens = [];
-  for (const [id, meta] of socketMeta.entries()) {
+
+  for (const [id, meta] of entries) {
     if (meta.room === room && !meta.isAdmin) {
       screens.push({
         id,
-        pseudo   : meta.pseudo,
-        isScreen : meta.pseudo?.startsWith('Screen_')
+        pseudo: meta.pseudo,
+        isScreen: meta.pseudo?.startsWith("Screen_"),
       });
     }
   }
+
   return screens;
 }
 

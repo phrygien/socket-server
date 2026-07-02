@@ -1,7 +1,6 @@
 // ─── Message Handler ──────────────────────────────────────────────────────────
-
-const socketMeta = require('../store');
-const { log }    = require('../utils/logger');
+const store = require("../store");
+const { log } = require("../utils/logger");
 
 function registerMessageHandler(io, socket) {
   /**
@@ -25,20 +24,28 @@ function registerMessageHandler(io, socket) {
    * Types envoyés par le follower → admin :
    *   follow          { state: true }          heartbeat toutes les 3 min
    *   getScreen       {}                       demande état du lot courant (screen.php)
+   *
+   * NOTE clustering : io.to(data.toid).emit(...) cible un socket.id précis,
+   * pas une room. L'adapter Redis Socket.IO gère aussi ce cas (chaque socket
+   * a implicitement sa propre room nommée d'après son id) — donc ce message
+   * privé traverse correctement les instances même si l'émetteur et le
+   * destinataire sont sur des instances différentes.
    */
-  socket.on('getMsgPrivate', (data) => {
+  socket.on("getMsgPrivate", async (data) => {
     if (!data || !data.toid) return;
 
+    const meta = await store.get(socket.id);
+
     const payload = {
-      type : data.type || '',
-      msg  : data.msg  || {},
-      name : data.name || socketMeta.get(socket.id)?.pseudo || 'unknown',
-      from : socket.id
+      type: data.type || "",
+      msg: data.msg || {},
+      name: data.name || meta?.pseudo || "unknown",
+      from: socket.id,
     };
 
     log(`  [private→${data.toid}] type="${data.type}" from=${socket.id}`);
 
-    io.to(data.toid).emit('sendMsg', payload);
+    io.to(data.toid).emit("sendMsg", payload);
   });
 }
 

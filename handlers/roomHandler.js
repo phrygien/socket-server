@@ -17,9 +17,15 @@
 //     déconnexion/reconnexion), l'ancien socket est expulsé immédiatement
 //     au lieu d'attendre le pingTimeout (20s). Évite que deux sockets
 //     admin émettent/reçoivent en parallèle sur la même room.
+//
+//  Correctif clustering (Redis store) :
+//  6. store.get() retourne un objet désérialisé à chaque appel — le muter
+//     localement (meta.room = ...) n'a aucun effet sur Redis. Chaque
+//     changement d'état est désormais persisté explicitement via
+//     store.set(socketId, meta) après modification.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const socketMeta = require("../store");
+const store = require("../store");
 const { log } = require("../utils/logger");
 const {
   getAdminOfRoom,
@@ -59,6 +65,14 @@ const ADMIN_ONLY_TYPES = new Set([
 //
 // Solution : buffer en mémoire (tableau) + flush async toutes les 5 secondes.
 // Zéro impact sur le hot path Socket.IO.
+//
+// NOTE clustering : ce buffer reste LOCAL à chaque instance. Chaque instance
+// écrit dans son propre historique.json — si tu veux un historique unifié
+// entre app1..app4, il faudra soit centraliser sur un volume partagé, soit
+// écrire dans Redis/une base au lieu du disque local. Pour l'instant chaque
+// instance produit son propre fichier, ce qui est correct si HISTORIQUE_PATH
+// pointe vers un volume monté séparément par instance, mais À VÉRIFIER si tu
+// veux un historique global consolidé.
 // ─────────────────────────────────────────────────────────────────────────────
 
 let historiqueBuffer = [];
@@ -117,17 +131,6 @@ function flushHistoriqueSync() {
 process.on("SIGTERM", flushHistoriqueSync);
 process.on("SIGINT", flushHistoriqueSync);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// NOTE : updateHistoriquePseudo supprimé
-//
-// L'ancienne version faisait readFileSync → parse → find → writeFileSync
-// pour mettre à jour le pseudo — opération coûteuse bloquante.
-//
-// Désormais le pseudo est inclus directement dans l'entrée joinroom
-// via socketMeta (mis à jour dès 'username'), ou mis à jour dans le buffer
-// en mémoire avant le flush.
-// ─────────────────────────────────────────────────────────────────────────────
-
 /**
  * Met à jour le pseudo dans le buffer en mémoire (pas de I/O).
  * @param {string} socketId
@@ -160,14 +163,25 @@ function getClientIp(socket) {
 // déjà enregistré comme admin de cette room. Si oui, on le considère comme
 // obsolète (ancienne connexion suite à reconnexion/changement réseau) et on
 // le déconnecte immédiatement, ce qui déclenche son propre 'disconnect'
-// (→ disconnectHandler fait le ménage : socketMeta.delete + broadcastUserList).
+// (→ disconnectHandler fait le ménage : store.delete + broadcastUserList).
 //
 // Si le socket n'existe plus côté transport (fantôme déjà fermé mais pas
-// encore nettoyé du store), on supprime directement son entrée socketMeta.
+// encore nettoyé du store), on supprime directement son entrée dans le store.
+//
+// NOTE clustering : io.sockets.sockets.get(existingAdminId) ne trouve QUE les
+// sockets connectées à CETTE instance. Si l'ancien admin est connecté sur une
+// autre instance (app2 alors qu'on traite l'event sur app1), oldSocket sera
+// undefined ici même s'il est bien vivant ailleurs — on tombera alors dans la
+// branche "fantôme" et on supprimera son entrée store à tort, sans fermer sa
+// vraie connexion. Pour un nettoyage cross-instance fiable, il faudrait
+// émettre un event Redis Pub/Sub ciblé (ex: via l'adapter Socket.IO) demandant
+// à l'instance propriétaire de déconnecter ce socket. À considérer si les
+// admins changent fréquemment d'instance (peu probable avec sticky sessions,
+// mais possible après un redéploiement/restart d'instance).
 // ─────────────────────────────────────────────────────────────────────────────
 
-function evictStaleAdmin(io, room, incomingSocketId) {
-  const existingAdminId = getAdminOfRoom(room);
+async function evictStaleAdmin(io, room, incomingSocketId) {
+  const existingAdminId = await getAdminOfRoom(room);
   if (!existingAdminId || existingAdminId === incomingSocketId) return;
 
   const oldSocket = io.sockets.sockets.get(existingAdminId);
@@ -179,9 +193,9 @@ function evictStaleAdmin(io, room, incomingSocketId) {
     oldSocket.disconnect(true); // ferme proprement → déclenche disconnectHandler
   } else {
     log(
-      `  [ADMIN REPLACE] ancien admin=${existingAdminId} déjà fantôme, nettoyage direct du store`,
+      `  [ADMIN REPLACE] ancien admin=${existingAdminId} déjà fantôme (ou sur une autre instance), nettoyage direct du store`,
     );
-    socketMeta.delete(existingAdminId);
+    await store.delete(existingAdminId);
   }
 }
 
@@ -191,28 +205,33 @@ function registerRoomHandler(io, socket) {
   /**
    * Rejoindre une salle.
    */
-  socket.on("joinroom", (room) => {
+  socket.on("joinroom", async (room) => {
     if (typeof room !== "string" || !room.trim()) {
       log(`  [joinroom] REFUSÉ room invalide – socket=${socket.id}`);
       return;
     }
 
-    const meta = socketMeta.get(socket.id);
+    const meta = await store.get(socket.id);
     const clientIp = getClientIp(socket);
 
     // Quitter l'ancienne salle
     if (meta?.room) {
       socket.leave(meta.room);
-      if (meta.isAdmin) broadcastUserList(io, meta.room);
+      if (meta.isAdmin) await broadcastUserList(io, meta.room);
     }
 
     // ── Anti double-admin : expulser tout admin précédent sur cette room ──
     if (meta?.isAdmin) {
-      evictStaleAdmin(io, room, socket.id);
+      await evictStaleAdmin(io, room, socket.id);
     }
 
     socket.join(room);
-    if (meta) meta.room = room;
+
+    // Persister le changement de room dans le store partagé
+    if (meta) {
+      meta.room = room;
+      await store.set(socket.id, meta);
+    }
 
     log(
       `  [joinroom] socket=${socket.id} → room="${room}" ip=${clientIp} admin=${meta?.isAdmin}`,
@@ -230,9 +249,9 @@ function registerRoomHandler(io, socket) {
     });
 
     if (meta?.isAdmin) {
-      broadcastUserList(io, room);
+      await broadcastUserList(io, room);
     } else {
-      const adminId = getAdminOfRoom(room);
+      const adminId = await getAdminOfRoom(room);
       socket.emit("userList", { admin: adminId });
       log(`  [userList→${socket.id}] admin=${adminId || "none"}`);
     }
@@ -240,12 +259,16 @@ function registerRoomHandler(io, socket) {
 
   // ───────────────────────────────────────────────────────────────────────────
 
-  socket.on("username", (pseudo) => {
+  socket.on("username", async (pseudo) => {
     if (typeof pseudo !== "string" || !pseudo.trim()) return;
 
     const trimmed = pseudo.trim();
-    const meta = socketMeta.get(socket.id);
-    if (meta) meta.pseudo = trimmed;
+    const meta = await store.get(socket.id);
+
+    if (meta) {
+      meta.pseudo = trimmed;
+      await store.set(socket.id, meta);
+    }
 
     log(`  [username] socket=${socket.id} pseudo="${trimmed}"`);
 
@@ -255,7 +278,7 @@ function registerRoomHandler(io, socket) {
 
   // ───────────────────────────────────────────────────────────────────────────
 
-  socket.on("getMsgRoom", (data) => {
+  socket.on("getMsgRoom", async (data) => {
     // Contrôle 1 : champs obligatoires
     if (!data || typeof data.room !== "string" || !data.room.trim()) {
       log(
@@ -287,7 +310,7 @@ function registerRoomHandler(io, socket) {
     }
 
     // Contrôle 4 : types admin uniquement
-    const meta = socketMeta.get(socket.id);
+    const meta = await store.get(socket.id);
     if (ADMIN_ONLY_TYPES.has(data.type) && !meta?.isAdmin) {
       log(
         `  [getMsgRoom] REFUSÉ – type admin "${data.type}" émis par non-admin ${socket.id}`,
@@ -307,6 +330,7 @@ function registerRoomHandler(io, socket) {
     );
 
     // Diffuse à toute la salle — hot path, aucun I/O
+    // (io.to().emit() passe par l'adapter Redis, propagation cross-instance OK)
     io.to(data.room).emit("sendMsg", payload);
   });
 }

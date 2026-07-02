@@ -1,42 +1,32 @@
 // ─── Disconnect Handler ───────────────────────────────────────────────────────
-
-const socketMeta            = require('../store');
-const { log }               = require('../utils/logger');
-const { broadcastUserList } = require('../services/roomService');
+const store = require("../store");
+const { log } = require("../utils/logger");
+const { broadcastUserList } = require("../services/roomService");
 
 function registerDisconnectHandler(io, socket) {
-  socket.on('disconnect', (reason) => {
+  socket.on("disconnect", async (reason) => {
+    const meta = await store.get(socket.id);
 
-    const meta = socketMeta.get(socket.id);
+    log(`- Déconnexion: ${socket.id} (${reason})`);
 
     // Supprimer du store EN PREMIER pour que broadcastUserList
-    // ne retrouve plus cet utilisateur dans les listes
-    socketMeta.delete(socket.id);
+    // ne retrouve plus cet admin dans getAdminOfRoom
+    await store.delete(socket.id);
 
-    if (!meta?.room) return;
-
-    try {
-
+    if (meta?.room) {
       // Notifie la salle qu'un utilisateur est parti
-      io.to(meta.room).emit('sendMsg', {
-        type : 'exit',
-        msg  : { room: meta.room, email: meta.email || '' },
-        name : meta.pseudo || 'unknown',
-        from : socket.id
+      io.to(meta.room).emit("sendMsg", {
+        type: "exit",
+        msg: { room: meta.room, email: meta.email || "" },
+        name: meta.pseudo || "unknown",
+        from: socket.id,
       });
 
-      // Rebroadcast la liste utilisateurs (admin ET bidder)
-      broadcastUserList(io, meta.room);
-
-      // Log spécifique si c'était l'admin
+      // Si c'était l'admin → les bidders doivent cacher le formulaire d'enchère
       if (meta.isAdmin) {
-        log(`[ADMIN OFFLINE] room=${meta.room} socket=${socket.id}`);
+        await broadcastUserList(io, meta.room);
       }
-
-    } catch (err) {
-      log(`[ERROR] disconnect handler socket=${socket.id} : ${err.message}`);
     }
-
   });
 }
 

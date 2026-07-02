@@ -1,4 +1,16 @@
-const socketMeta = require("../store");
+// ─── Bidder Handler ───────────────────────────────────────────────────────────
+//
+// Adaptation clustering (Redis store) :
+//   store.get() retourne un objet désérialisé à chaque appel — le muter
+//   localement (meta.pseudo = ..., meta.room = ...) n'a aucun effet sur
+//   Redis. Chaque changement d'état est désormais persisté explicitement
+//   via store.set(socketId, meta) après modification.
+//
+//   updateSaleEndTimer n'utilise pas le store ici — laissé synchrone/tel
+//   quel, à vérifier si saleEndService.js consomme lui aussi le store et
+//   nécessiterait le même traitement.
+
+const store = require("../store");
 const { log } = require("../utils/logger");
 const { getAdminOfRoom } = require("../services/roomService");
 const { updateSaleEndTimer } = require("../services/saleEndService");
@@ -9,14 +21,18 @@ function registerBidderHandler(io, socket) {
    * socket.emit('username', pseudo)
    * Répond immédiatement avec l'ID de l'admin de la salle.
    */
-  socket.on("username", (pseudo) => {
-    const meta = socketMeta.get(socket.id);
-    if (meta) meta.pseudo = pseudo || "Bidder";
+  socket.on("username", async (pseudo) => {
+    const meta = await store.get(socket.id);
+    if (meta) {
+      meta.pseudo = pseudo || "Bidder";
+      await store.set(socket.id, meta);
+    }
+
     log(`  [username] : ${socket.id} → "${pseudo}"`);
 
     const room = meta?.room;
     if (room) {
-      const adminId = getAdminOfRoom(room);
+      const adminId = await getAdminOfRoom(room);
       socket.emit("userList", { admin: adminId });
       log(`  [userList→${socket.id}] admin=${adminId || "none"}`);
     }
@@ -26,8 +42,9 @@ function registerBidderHandler(io, socket) {
    * Connexion initiale du bidder.
    * socket.emit('connected', { name, email, room })
    */
-  socket.on("connected", (data) => {
-    const meta = socketMeta.get(socket.id);
+  socket.on("connected", async (data) => {
+    const meta = await store.get(socket.id);
+
     if (meta && data) {
       meta.pseudo = data.name || meta.pseudo;
       meta.email = data.email || "";
@@ -35,6 +52,7 @@ function registerBidderHandler(io, socket) {
         socket.join(data.room);
         meta.room = data.room;
       }
+      await store.set(socket.id, meta);
     }
 
     const room = meta?.room;
@@ -56,8 +74,9 @@ function registerBidderHandler(io, socket) {
    * Reconnexion d'un bidder (changement de device / rechargement).
    * socket.emit('reconnection', { name, email, room })
    */
-  socket.on("reconnection", (data) => {
-    const meta = socketMeta.get(socket.id);
+  socket.on("reconnection", async (data) => {
+    const meta = await store.get(socket.id);
+
     if (meta && data) {
       meta.pseudo = data.name || meta.pseudo;
       meta.email = data.email || "";
@@ -65,6 +84,7 @@ function registerBidderHandler(io, socket) {
         socket.join(data.room);
         meta.room = data.room;
       }
+      await store.set(socket.id, meta);
     }
 
     const room = meta?.room;
@@ -87,8 +107,9 @@ function registerBidderHandler(io, socket) {
    * Émis par vente_list.php  : socket.emit('getEncheresList', { room })
    * Émis par switcher_list.php côté bidder : type reçu 'getEncheres'
    */
-  socket.on("getEncheresList", (data) => {
-    const room = socketMeta.get(socket.id)?.room || data?.room;
+  socket.on("getEncheresList", async (data) => {
+    const meta = await store.get(socket.id);
+    const room = meta?.room || data?.room;
     if (!room) return;
 
     log(`  [getList]  : ${socket.id} → ${room}`);
@@ -96,7 +117,7 @@ function registerBidderHandler(io, socket) {
     io.to(room).emit("sendMsg", {
       type: "getEncheresList",
       msg: data || {},
-      name: socketMeta.get(socket.id)?.pseudo || "unknown",
+      name: meta?.pseudo || "unknown",
       from: socket.id,
     });
   });
@@ -106,8 +127,9 @@ function registerBidderHandler(io, socket) {
    * L'admin (switcher_list.php) reçoit ce sendMsg et répond
    * en privé avec getMsgPrivate({ type: 'numLot', … }).
    */
-  socket.on("getEncheres", (data) => {
-    const room = socketMeta.get(socket.id)?.room || data?.room;
+  socket.on("getEncheres", async (data) => {
+    const meta = await store.get(socket.id);
+    const room = meta?.room || data?.room;
     if (!room) return;
 
     log(`  [getEnch]  : ${socket.id} → ${room}`);
@@ -115,7 +137,7 @@ function registerBidderHandler(io, socket) {
     io.to(room).emit("sendMsg", {
       type: "getEncheres",
       msg: data || {},
-      name: socketMeta.get(socket.id)?.pseudo || "unknown",
+      name: meta?.pseudo || "unknown",
       from: socket.id,
     });
   });
@@ -124,8 +146,8 @@ function registerBidderHandler(io, socket) {
    * Enchère placée par un bidder.
    * socket.emit('doEncheres', { lot, myEnchere, room })
    */
-  socket.on("doEncheres", (data) => {
-    const meta = socketMeta.get(socket.id);
+  socket.on("doEncheres", async (data) => {
+    const meta = await store.get(socket.id);
     const room = meta?.room || data?.room;
     if (!room) return;
 
@@ -145,8 +167,8 @@ function registerBidderHandler(io, socket) {
    * Vérification de présence (heartbeat).
    * socket.emit('follow', data)
    */
-  socket.on("follow", (data) => {
-    const meta = socketMeta.get(socket.id);
+  socket.on("follow", async (data) => {
+    const meta = await store.get(socket.id);
     const room = meta?.room;
     if (!room) return;
 
@@ -172,11 +194,11 @@ function registerBidderHandler(io, socket) {
    * C'est ici que transitent les numLot et listLot envoyés par l'admin
    * → on en profite pour mettre à jour le timer de fin de vente.
    */
-  socket.on("getMsgPrivate", (data) => {
+  socket.on("getMsgPrivate", async (data) => {
     if (!data) return;
 
     const { toid, type, msg, name } = data;
-    const meta = socketMeta.get(socket.id);
+    const meta = await store.get(socket.id);
     const room = meta?.room;
 
     log(`  [getMsgPrv]: from=${socket.id} to=${toid || "room"} type=${type}`);

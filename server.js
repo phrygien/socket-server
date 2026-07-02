@@ -1,14 +1,16 @@
 /**
  * Serveur Socket.IO — Auctav Live Sales
- * VERSION STABLE MOBILE + APACHE + SOCKET.IO v2/v3/v4
+ * VERSION CLUSTERISÉE — Docker + Traefik + Redis adapter (multi-instances)
  */
 
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
+const { createAdapter } = require("@socket.io/redis-adapter");
+const Redis = require("ioredis");
 
 const { PORT } = require("./config");
-const socketMeta = require("./store");
+const store = require("./store");
 const { log } = require("./utils/logger");
 
 const { getRoomStats } = require("./services/roomService");
@@ -45,39 +47,70 @@ app.use(express.json());
 const ALLOWED_ORIGINS = [
   "https://www.auctav.com",
   "https://auctav.com",
-  "https://dev.astucom.com",
+  "https://socket-auctav.astucom.com",
   "http://localhost",
   "http://127.0.0.1",
 ];
 
 // ─────────────────────────────────────────────────────────────
+// RATE LIMITING PAR IP
+//
+// NOTE clustering : connPerIP reste un Map LOCAL à chaque instance.
+// Un même client (même IP) peut donc ouvrir jusqu'à MAX_CONN connexions
+// PAR INSTANCE (donc potentiellement 4x MAX_CONN au total réparties sur
+// app1..app4), pas MAX_CONN au global. Avec le sticky session, un même
+// navigateur reste normalement collé à la même instance donc l'effet est
+// limité en pratique, mais ce n'est plus une vraie limite globale par IP.
+// Si tu veux une limite stricte globale, il faudrait migrer connPerIP vers
+// un compteur Redis partagé (INCR/DECR par IP), sur le même principe que
+// store.js.
+// ─────────────────────────────────────────────────────────────
+
+const connPerIP = new Map();
+const MAX_CONN = 5;
+
+// Nettoyage périodique — évite la fuite mémoire sur sockets zombies
+setInterval(() => {
+  let cleaned = 0;
+  for (const [ip, count] of connPerIP.entries()) {
+    if (count <= 0) {
+      connPerIP.delete(ip);
+      cleaned++;
+    }
+  }
+  if (cleaned > 0) {
+    log(`[RATE LIMIT] Nettoyage : ${cleaned} entrées supprimées`);
+  }
+}, 60_000);
+
+// ─────────────────────────────────────────────────────────────
 // HEALTH CHECK
 // ─────────────────────────────────────────────────────────────
 
-app.get("/", (_req, res) => {
+app.get("/", async (_req, res) => {
   res.json({
     status: "ok",
     uptime: process.uptime(),
-    //rooms   : getRoomStats(),
+    // rooms   : await getRoomStats(),
     memory: process.memoryUsage(),
-    sockets: socketMeta.size,
-    connPerIP: connPerIP.size, // utile pour monitorer les IPs actives
+    sockets: await store.size(),
+    connPerIP: connPerIP.size, // utile pour monitorer les IPs actives sur CETTE instance
   });
 });
 
 // Followers debug
-app.get("/follow/:room", (req, res) => {
+app.get("/follow/:room", async (req, res) => {
   res.json({
     room: req.params.room,
-    followers: getFollowersInRoom(req.params.room),
+    followers: await getFollowersInRoom(req.params.room),
   });
 });
 
 // Screens debug
-app.get("/screen/:room", (req, res) => {
+app.get("/screen/:room", async (req, res) => {
   res.json({
     room: req.params.room,
-    screens: getScreensInRoom(req.params.room),
+    screens: await getScreensInRoom(req.params.room),
   });
 });
 
@@ -128,25 +161,34 @@ const io = new Server(server, {
 });
 
 // ─────────────────────────────────────────────────────────────
-// RATE LIMITING PAR IP
+// REDIS ADAPTER — propagation des events entre app1..app4
+//
+// Sans cet adapter, io.to(room).emit(...) et io.emit(...) ne touchent QUE
+// les clients connectés à l'instance courante. Avec l'adapter, chaque
+// instance publie/écoute sur un canal Redis pub/sub partagé : un event émis
+// sur app1 est bien reçu par les clients connectés sur app2, app3, app4.
+//
+// Ce mécanisme est indépendant de store.js (qui partage les métadonnées) —
+// les deux sont nécessaires pour un clustering correct.
 // ─────────────────────────────────────────────────────────────
 
-const connPerIP = new Map();
-const MAX_CONN = 5;
+const pubClient = new Redis(process.env.REDIS_URL || "redis://redis:6379");
+const subClient = pubClient.duplicate();
 
-// Nettoyage périodique — évite la fuite mémoire sur sockets zombies
-setInterval(() => {
-  let cleaned = 0;
-  for (const [ip, count] of connPerIP.entries()) {
-    if (count <= 0) {
-      connPerIP.delete(ip);
-      cleaned++;
-    }
-  }
-  if (cleaned > 0) {
-    log(`[RATE LIMIT] Nettoyage : ${cleaned} entrées supprimées`);
-  }
-}, 60_000);
+pubClient.on("error", (err) =>
+  log(`[REDIS ADAPTER] Erreur pubClient : ${err.message}`),
+);
+subClient.on("error", (err) =>
+  log(`[REDIS ADAPTER] Erreur subClient : ${err.message}`),
+);
+
+io.adapter(createAdapter(pubClient, subClient));
+
+log(
+  `[REDIS ADAPTER] Adapter Socket.IO branché sur ${process.env.REDIS_URL || "redis://redis:6379"}`,
+);
+
+// ─────────────────────────────────────────────────────────────
 
 io.use((socket, next) => {
   const ip =
@@ -173,10 +215,10 @@ io.use((socket, next) => {
 // SOCKET CONNECTION
 // ─────────────────────────────────────────────────────────────
 
-io.on("connection", (socket) => {
+io.on("connection", async (socket) => {
   log(`+ Connexion : ${socket.id}`);
 
-  socketMeta.set(socket.id, {
+  await store.set(socket.id, {
     pseudo: "unknown",
     room: null,
     isAdmin: false,
@@ -223,7 +265,9 @@ io.on("connection", (socket) => {
 
 server.listen(PORT, () => {
   log(`Socket.IO server démarré sur port ${PORT}`);
-  log(`Mode : PRODUCTION`);
+  log(
+    `Mode : PRODUCTION (clusterisé, instance=${process.env.INSTANCE_ID || "unknown"})`,
+  );
   log(`Health : http://localhost:${PORT}/`);
 });
 
@@ -231,20 +275,27 @@ server.listen(PORT, () => {
 // GRACEFUL SHUTDOWN
 // ─────────────────────────────────────────────────────────────
 
-process.on("SIGTERM", () => {
-  log("SIGTERM reçu — arrêt propre");
-  server.close(() => process.exit(0));
-});
+async function shutdown(signal) {
+  log(`${signal} reçu — arrêt propre`);
+  server.close(async () => {
+    try {
+      await store.close();
+      await pubClient.quit();
+      await subClient.quit();
+    } catch (err) {
+      log(`[SHUTDOWN] Erreur fermeture Redis : ${err.message}`);
+    }
+    process.exit(0);
+  });
+}
 
-process.on("SIGINT", () => {
-  log("SIGINT reçu — arrêt propre");
-  server.close(() => process.exit(0));
-});
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 // ─────────────────────────────────────────────────────────────
 // PROTECTION GLOBALE CONTRE LES CRASHS
-// Ajout de process.exit(1) — laisse PM2 redémarrer proprement
-// plutôt que continuer dans un état corrompu
+// Ajout de process.exit(1) — laisse Docker (restart: unless-stopped)
+// redémarrer proprement plutôt que continuer dans un état corrompu
 // ─────────────────────────────────────────────────────────────
 
 process.on("uncaughtException", (err) => {
