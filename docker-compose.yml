@@ -24,7 +24,7 @@ services:
         condition: service_healthy
     environment:
       - NODE_ENV=production
-      - PORT=9022
+      - PORT=${APP_PORT}
       - INSTANCE_ID=app1
       - REDIS_URL=redis://redis:6379
     networks:
@@ -40,7 +40,7 @@ services:
       - "traefik.http.routers.auctav-socket.tls.certresolver=letsencrypt"
 
       # --- Service / Load balancer ---
-      - "traefik.http.services.auctav-socket.loadbalancer.server.port=9022"
+      - "traefik.http.services.auctav-socket.loadbalancer.server.port=${APP_PORT}"
 
       # --- Sticky session — OBLIGATOIRE pour Socket.IO (polling) ---
       - "traefik.http.services.auctav-socket.loadbalancer.sticky.cookie=true"
@@ -59,7 +59,7 @@ services:
         condition: service_healthy
     environment:
       - NODE_ENV=production
-      - PORT=9022
+      - PORT=${APP_PORT}
       - INSTANCE_ID=app2
       - REDIS_URL=redis://redis:6379
     networks:
@@ -77,7 +77,7 @@ services:
         condition: service_healthy
     environment:
       - NODE_ENV=production
-      - PORT=9022
+      - PORT=${APP_PORT}
       - INSTANCE_ID=app3
       - REDIS_URL=redis://redis:6379
     networks:
@@ -95,7 +95,7 @@ services:
         condition: service_healthy
     environment:
       - NODE_ENV=production
-      - PORT=9022
+      - PORT=${APP_PORT}
       - INSTANCE_ID=app4
       - REDIS_URL=redis://redis:6379
     networks:
