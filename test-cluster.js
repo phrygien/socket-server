@@ -133,10 +133,13 @@ async function testCrossInstanceBroadcast() {
 
         // Écoute les messages diffusés à la room
         client.on("sendMsg", (payload) => {
-          if (
-            payload?.type === "cluster-test-ping" &&
-            payload.from !== client.id
-          ) {
+          // FIX : le serveur (roomHandler.js → getMsgRoom) renvoie le
+          // "type" tel qu'il a été émis, donc "message" (voir emit plus
+          // bas), pas "cluster-test-ping". L'ancien check comparait à
+          // "cluster-test-ping", qui ne correspondait à rien envoyé par
+          // le serveur → 0 client ne passait jamais le test, même quand
+          // l'adapter Redis fonctionnait correctement.
+          if (payload?.type === "message" && payload.from !== client.id) {
             received.add(i);
           }
         });
