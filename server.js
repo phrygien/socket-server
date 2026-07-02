@@ -47,7 +47,7 @@ app.use(express.json());
 const ALLOWED_ORIGINS = [
   "https://www.auctav.com",
   "https://auctav.com",
-  "https://socket-auctav.astucom.com",
+  "https://dev.astucom.com",
   "http://localhost",
   "http://127.0.0.1",
 ];
@@ -90,6 +90,7 @@ setInterval(() => {
 app.get("/", async (_req, res) => {
   res.json({
     status: "ok",
+    instance: process.env.INSTANCE_ID || "unknown",
     uptime: process.uptime(),
     // rooms   : await getRoomStats(),
     memory: process.memoryUsage(),
