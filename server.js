@@ -47,7 +47,7 @@ app.use(express.json());
 const ALLOWED_ORIGINS = [
   "https://www.auctav.com",
   "https://auctav.com",
-  "https://dev.astucom.com",
+  "https://socket-auctav.astucom.com",
   "http://localhost",
   "http://127.0.0.1",
 ];
