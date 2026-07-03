@@ -47,7 +47,7 @@ services:
       - "traefik.http.services.auctav-socket.loadbalancer.sticky.cookie.name=SERVERID"
       - "traefik.http.services.auctav-socket.loadbalancer.sticky.cookie.httpOnly=true"
       - "traefik.http.services.auctav-socket.loadbalancer.sticky.cookie.secure=true"
-      - "traefik.http.services.auctav-socket.loadbalancer.sticky.cookie.samesite=lax"
+      - "traefik.http.services.auctav-socket.loadbalancer.sticky.cookie.samesite=none"
 
   app2:
     build: .
