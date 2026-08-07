@@ -23,24 +23,6 @@
 //     localement (meta.room = ...) n'a aucun effet sur Redis. Chaque
 //     changement d'état est désormais persisté explicitement via
 //     store.set(socketId, meta) après modification.
-//
-//  Correctif multi-room admin (FIX auctav_screen / auctav_follow) :
-//  7. L'admin (live.php) ne fait 'joinroom' que sur sa room de vente
-//     ("auctavXX"). Pour que les écrans (screen.php) et les followers
-//     (follow.php), qui rejoignent respectivement "auctav_screen" et
-//     "auctav_follow", puissent :
-//       a) retrouver l'admin via getAdminOfRoom(room) → besoin que le
-//          store sache que ce socket est admin de CES salles aussi
-//          (meta.rooms, voir roomService.js) ;
-//       b) recevoir les getMsgRoom émis par l'admin vers ces salles →
-//          besoin que socket.rooms.has(room) soit vrai côté Socket.IO
-//          natif (contrôle 2 ci-dessous) ;
-//     on ajoute un nouvel event 'joinExtra' qui fait socket.join(room)
-//     SANS écraser meta.room (qui reste la room de vente, utilisée pour
-//     toute la logique existante liée à la vente), et ajoute la room à
-//     meta.rooms (tableau des rooms additionnelles). L'admin appelle
-//     joinExtra('auctav_screen') et joinExtra('auctav_follow') à la
-//     connexion, en plus de joinroom(room).
 // ─────────────────────────────────────────────────────────────────────────────
 
 const store = require("../store");
@@ -221,7 +203,7 @@ async function evictStaleAdmin(io, room, incomingSocketId) {
 
 function registerRoomHandler(io, socket) {
   /**
-   * Rejoindre une salle (room "principale" — vente en cours).
+   * Rejoindre une salle.
    */
   socket.on("joinroom", async (room) => {
     if (typeof room !== "string" || !room.trim()) {
@@ -277,51 +259,6 @@ function registerRoomHandler(io, socket) {
 
   // ───────────────────────────────────────────────────────────────────────────
 
-  /**
-   * Rejoindre une salle ADDITIONNELLE, sans changer la room "principale".
-   *
-   * Cas d'usage : l'admin (live.php) est déjà dans sa room de vente
-   * ("auctavXX", via joinroom) et doit AUSSI être identifiable comme admin
-   * dans "auctav_screen" (screen.php) et "auctav_follow" (follow.php), pour
-   * que :
-   *   - getAdminOfRoom('auctav_screen') / ('auctav_follow') le retrouve
-   *     (voir meta.rooms dans roomService.js) ;
-   *   - le contrôle anti-room-forgery de getMsgRoom laisse passer les
-   *     messages qu'il émet vers ces salles (socket.rooms.has(room)).
-   *
-   * N'écrase JAMAIS meta.room et ne déclenche PAS l'anti double-admin
-   * (une salle auxiliaire peut légitimement recevoir plusieurs sockets
-   * admin au fil des reconnexions ; le nettoyage se fait au disconnect).
-   */
-  socket.on("joinExtra", async (room) => {
-    if (typeof room !== "string" || !room.trim()) {
-      log(`  [joinExtra] REFUSÉ room invalide – socket=${socket.id}`);
-      return;
-    }
-
-    socket.join(room);
-
-    const meta = await store.get(socket.id);
-    if (meta) {
-      if (!Array.isArray(meta.rooms)) meta.rooms = [];
-      if (!meta.rooms.includes(room)) meta.rooms.push(room);
-      await store.set(socket.id, meta);
-    }
-
-    log(
-        `  [joinExtra] socket=${socket.id} → room="${room}" (additionnelle, admin=${meta?.isAdmin})`,
-    );
-
-    // Notifie tout de suite la salle qu'un admin est dispo — sinon un
-    // screen.php/follow.php déjà chargé, qui a reçu admin:null AVANT que
-    // l'admin ne rejoigne, resterait bloqué indéfiniment sur $("#all").hide().
-    if (meta?.isAdmin) {
-      await broadcastUserList(io, room);
-    }
-  });
-
-  // ───────────────────────────────────────────────────────────────────────────
-
   socket.on("username", async (pseudo) => {
     if (typeof pseudo !== "string" || !pseudo.trim()) return;
 
@@ -357,8 +294,6 @@ function registerRoomHandler(io, socket) {
     }
 
     // Contrôle 2 : appartenance à la salle
-    // (satisfait pour la room de vente via 'joinroom', et pour
-    // auctav_screen / auctav_follow via 'joinExtra')
     if (!socket.rooms.has(data.room)) {
       log(
           `  [getMsgRoom] REFUSÉ – ${socket.id} n'appartient pas à "${data.room}"`,
