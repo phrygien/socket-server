@@ -23,6 +23,14 @@
 //     localement (meta.room = ...) n'a aucun effet sur Redis. Chaque
 //     changement d'état est désormais persisté explicitement via
 //     store.set(socketId, meta) après modification.
+//
+//  Correctif doublon (audit du bug "enchère validée puis refusée") :
+//  7. 'username' était AUSSI écouté dans bidderHandler.js (retiré de ce
+//     fichier-là). C'est désormais le SEUL listener 'username' du socket.
+//     On reprend ici le comportement utile qu'avait bidderHandler.js
+//     (émettre 'userList' au socket après identification, pour que le
+//     bidder connaisse l'admin courant sans attendre un autre event) afin
+//     de ne perdre aucune fonctionnalité en supprimant le doublon.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const store = require("../store");
@@ -259,6 +267,16 @@ function registerRoomHandler(io, socket) {
 
   // ───────────────────────────────────────────────────────────────────────────
 
+  /**
+   * Identification du bidder/admin par pseudo.
+   * socket.emit('username', pseudo)
+   *
+   * NOTE : c'est désormais le SEUL listener 'username' enregistré
+   * (bidderHandler.js a été vidé de son doublon — voir son en-tête).
+   * On reprend ici l'émission 'userList' qu'avait bidderHandler.js, pour
+   * que le bidder reçoive bien l'id de l'admin courant juste après s'être
+   * identifié (utile en cas de 'username' ré-émis sans 'joinroom').
+   */
   socket.on("username", async (pseudo) => {
     if (typeof pseudo !== "string" || !pseudo.trim()) return;
 
@@ -274,6 +292,15 @@ function registerRoomHandler(io, socket) {
 
     // Mise à jour en mémoire uniquement — zéro I/O
     updateBufferPseudo(socket.id, trimmed);
+
+    // Notifie le socket de l'admin courant de sa salle (comportement repris
+    // de l'ancien listener dupliqué dans bidderHandler.js)
+    const room = meta?.room;
+    if (room) {
+      const adminId = await getAdminOfRoom(room);
+      socket.emit("userList", { admin: adminId });
+      log(`  [userList→${socket.id}] admin=${adminId || "none"}`);
+    }
   });
 
   // ───────────────────────────────────────────────────────────────────────────

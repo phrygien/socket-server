@@ -9,25 +9,6 @@
 //   updateSaleEndTimer n'utilise pas le store ici — laissé synchrone/tel
 //   quel, à vérifier si saleEndService.js consomme lui aussi le store et
 //   nécessiterait le même traitement.
-//
-// FIX (audit complémentaire au bug "enchère validée puis refusée") :
-//   Deux autres events étaient écoutés en double sur le même socket,
-//   exactement le même pattern que le bug 'getMsgPrivate' déjà corrigé :
-//
-//   1. 'username' était aussi écouté dans roomHandler.js.
-//      Le client émet 'joinroom' puis 'username' juste après (voir
-//      entete_cheval.php / vente_list.php) → les deux handlers tournaient
-//      en parallèle, chacun avec son propre store.get()/store.set() lu à
-//      quelques ms d'écart → risque de race condition sur le Hash Redis
-//      partagé (l'un pouvant écraser une mutation de l'autre pas encore
-//      persistée). Supprimé ici : la logique canonique 'username' vit
-//      désormais uniquement dans roomHandler.js (qui trim + valide + met
-//      à jour le buffer d'historique + notifie l'admin courant).
-//
-//   2. 'follow' était aussi écouté dans followHandler.js, avec un code
-//      quasi identique → chaque heartbeat déclenchait DEUX 'sendMsg' vers
-//      la salle. Supprimé ici : la logique canonique 'follow' vit
-//      désormais uniquement dans followHandler.js.
 
 const store = require("../store");
 const { log } = require("../utils/logger");
@@ -35,6 +16,28 @@ const { getAdminOfRoom } = require("../services/roomService");
 const { updateSaleEndTimer } = require("../services/saleEndService");
 
 function registerBidderHandler(io, socket) {
+  /**
+   * Identification du bidder.
+   * socket.emit('username', pseudo)
+   * Répond immédiatement avec l'ID de l'admin de la salle.
+   */
+  socket.on("username", async (pseudo) => {
+    const meta = await store.get(socket.id);
+    if (meta) {
+      meta.pseudo = pseudo || "Bidder";
+      await store.set(socket.id, meta);
+    }
+
+    log(`  [username] : ${socket.id} → "${pseudo}"`);
+
+    const room = meta?.room;
+    if (room) {
+      const adminId = await getAdminOfRoom(room);
+      socket.emit("userList", { admin: adminId });
+      log(`  [userList→${socket.id}] admin=${adminId || "none"}`);
+    }
+  });
+
   /**
    * Connexion initiale du bidder.
    * socket.emit('connected', { name, email, room })
@@ -56,7 +59,7 @@ function registerBidderHandler(io, socket) {
     if (!room) return;
 
     log(
-        `  [connected]: ${socket.id} "${data?.name}" (${data?.email}) → ${room}`,
+      `  [connected]: ${socket.id} "${data?.name}" (${data?.email}) → ${room}`,
     );
 
     io.to(room).emit("sendMsg", {
@@ -88,7 +91,7 @@ function registerBidderHandler(io, socket) {
     if (!room) return;
 
     log(
-        `  [reconnect]: ${socket.id} "${data?.name}" (${data?.email}) → ${room}`,
+      `  [reconnect]: ${socket.id} "${data?.name}" (${data?.email}) → ${room}`,
     );
 
     io.to(room).emit("sendMsg", {
@@ -149,11 +152,28 @@ function registerBidderHandler(io, socket) {
     if (!room) return;
 
     log(
-        `  [enchère]  : ${socket.id} lot=${data?.lot} montant=${data?.myEnchere}`,
+      `  [enchère]  : ${socket.id} lot=${data?.lot} montant=${data?.myEnchere}`,
     );
 
     io.to(room).emit("sendMsg", {
       type: "doEncheres",
+      msg: data || {},
+      name: meta?.pseudo || "unknown",
+      from: socket.id,
+    });
+  });
+
+  /**
+   * Vérification de présence (heartbeat).
+   * socket.emit('follow', data)
+   */
+  socket.on("follow", async (data) => {
+    const meta = await store.get(socket.id);
+    const room = meta?.room;
+    if (!room) return;
+
+    io.to(room).emit("sendMsg", {
+      type: "follow",
       msg: data || {},
       name: meta?.pseudo || "unknown",
       from: socket.id,
@@ -173,9 +193,6 @@ function registerBidderHandler(io, socket) {
    *
    * C'est ici que transitent les numLot et listLot envoyés par l'admin
    * → on en profite pour mettre à jour le timer de fin de vente.
-   *
-   * NOTE : ceci est désormais le SEUL listener 'getMsgPrivate' enregistré
-   * (messageHandler.js a été vidé pour éviter le doublon — voir son en-tête).
    */
   socket.on("getMsgPrivate", async (data) => {
     if (!data) return;
@@ -191,7 +208,7 @@ function registerBidderHandler(io, socket) {
     // Cas 1 : un seul lot mis à jour (ex: l'admin ouvre/met à jour un lot)
     if (type === "numLot" && msg?.time > 0 && room) {
       log(
-          `  [saleEnd]  : numLot lot=${msg.numLot} time=${msg.time}s room=${room}`,
+        `  [saleEnd]  : numLot lot=${msg.numLot} time=${msg.time}s room=${room}`,
       );
       updateSaleEndTimer(io, room, msg.time);
     }
@@ -226,7 +243,7 @@ function registerBidderHandler(io, socket) {
       if (msg.price === undefined && msg.myEnchere !== undefined) {
         msg.price = msg.myEnchere;
         log(
-            `  [confirmEnchere] price absent → copié depuis myEnchere=${msg.price} lot=${msg.lot}`,
+          `  [confirmEnchere] price absent → copié depuis myEnchere=${msg.price} lot=${msg.lot}`,
         );
       }
     }
