@@ -305,37 +305,6 @@ function registerRoomHandler(io, socket) {
 
   // ───────────────────────────────────────────────────────────────────────────
 
-  /**
-   * Rejoint une room SECONDAIRE (native Socket.IO), SANS quitter la room
-   * métier principale et SANS toucher meta.room dans le store.
-   *
-   * Contexte : 'joinroom' (ci-dessus) suppose UNE seule room par socket
-   * (il fait socket.leave(meta.room) avant de join la nouvelle). C'est
-   * voulu pour les bidders/l'admin sur la room de vente. Mais l'admin a
-   * aussi besoin d'appartenir à la room dédiée de l'écran géant
-   * ("auctav_screen_<sale_id>") pour pouvoir y diffuser via getMsgRoom
-   * (qui vérifie socket.rooms.has(data.room) — appartenance native
-   * Socket.IO, indépendante de meta.room).
-   *
-   * socket.join() est une primitive Socket.IO native : elle ajoute la room
-   * à socket.rooms SANS retirer les rooms déjà rejointes. On peut donc
-   * appeler ceci en plus de 'joinroom' sans effet de bord sur la room
-   * principale de la vente.
-   *
-   * socket.emit('joinExtraRoom', 'auctav_screen_52')
-   */
-  socket.on("joinExtraRoom", (room) => {
-    if (typeof room !== "string" || !room.trim()) {
-      log(`  [joinExtraRoom] REFUSÉ room invalide – socket=${socket.id}`);
-      return;
-    }
-
-    socket.join(room.trim());
-    log(`  [joinExtraRoom] socket=${socket.id} → room="${room.trim()}" (en plus de sa room principale)`);
-  });
-
-  // ───────────────────────────────────────────────────────────────────────────
-
   socket.on("getMsgRoom", async (data) => {
     // Contrôle 1 : champs obligatoires
     if (!data || typeof data.room !== "string" || !data.room.trim()) {
