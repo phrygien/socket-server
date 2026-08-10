@@ -1,52 +1,33 @@
 // ─── Message Handler ──────────────────────────────────────────────────────────
-const store = require("../store");
-const { log } = require("../utils/logger");
+//
+// FIX (bug "enchère validée puis refusée") :
+//   L'event 'getMsgPrivate' était écouté DEUX FOIS sur le même socket :
+//   une fois ici, une fois dans bidderHandler.js. Socket.IO exécute TOUS
+//   les listeners enregistrés pour un même event → chaque emit('getMsgPrivate', ...)
+//   du bidder déclenchait deux 'sendMsg' vers l'admin (switcher_list.php).
+//
+//   Côté admin, le handler 'doEncheres' compare myEnchere au prix courant :
+//     - 1er sendMsg (dupliqué) : myEnchere > price(ancien) → accepté, price mis à jour
+//     - 2e sendMsg (dupliqué)  : myEnchere == price (déjà mis à jour juste avant)
+//                                → plus strictement supérieur → branche "refusé"
+//                                → confirmEnchere{state:false} renvoyé au bidder
+//
+//   D'où le "Enchère refusée" affiché juste après "Enchère validée" pour la
+//   même mise.
+//
+//   Toute la logique de 'getMsgPrivate' (routage + mise à jour du timer de
+//   fin de vente + fix de compatibilité confirmEnchere.price) est déjà
+//   présente et centralisée dans bidderHandler.js. Ce fichier ne doit donc
+//   PLUS enregistrer de listener sur 'getMsgPrivate' pour éviter le doublon.
+//
+//   Ce module est conservé au cas où d'autres events de messagerie privée
+//   (non liés à 'getMsgPrivate') seraient ajoutés plus tard, mais n'a
+//   actuellement rien à enregistrer.
 
 function registerMessageHandler(io, socket) {
-  /**
-   * Message privé ciblé vers un socket précis.
-   * data = { toid, type, msg, name }
-   *
-   * Types envoyés par le bidder (vente_list.php) → admin :
-   *   reconnection  { room, email }        bidder rechargé / changement device
-   *   doEncheres    { room, myEnchere, lot, email }  enchère (mode live)
-   *   exit          { room, email }        bidder quitte volontairement
-   *   connected     { room, email }        réponse au heartbeat 'follow' de l'admin
-   *
-   * Types envoyés par l'admin → bidder :
-   *   confirmEnchere  { lot, state, manuel }   enchère acceptée ou refusée
-   *   validEnchere    { lot }                  enchère adjugée au bidder
-   *   changeDevice    {}                       déconnexion forcée (autre device détecté)
-   *   noActivity      {}                       déconnexion forcée (inactivité)
-   *   listLot         { … }                    envoi de la liste des lots
-   *   follow          {}                       heartbeat admin → demande présence
-   *
-   * Types envoyés par le follower → admin :
-   *   follow          { state: true }          heartbeat toutes les 3 min
-   *   getScreen       {}                       demande état du lot courant (screen.php)
-   *
-   * NOTE clustering : io.to(data.toid).emit(...) cible un socket.id précis,
-   * pas une room. L'adapter Redis Socket.IO gère aussi ce cas (chaque socket
-   * a implicitement sa propre room nommée d'après son id) — donc ce message
-   * privé traverse correctement les instances même si l'émetteur et le
-   * destinataire sont sur des instances différentes.
-   */
-  socket.on("getMsgPrivate", async (data) => {
-    if (!data || !data.toid) return;
-
-    const meta = await store.get(socket.id);
-
-    const payload = {
-      type: data.type || "",
-      msg: data.msg || {},
-      name: data.name || meta?.pseudo || "unknown",
-      from: socket.id,
-    };
-
-    log(`  [private→${data.toid}] type="${data.type}" from=${socket.id}`);
-
-    io.to(data.toid).emit("sendMsg", payload);
-  });
+  // Intentionnellement vide : voir note ci-dessus.
+  // Ne PAS réenregistrer 'getMsgPrivate' ici — géré exclusivement par
+  // bidderHandler.js (registerBidderHandler).
 }
 
 module.exports = { registerMessageHandler };
