@@ -28,59 +28,11 @@
 //      quasi identique → chaque heartbeat déclenchait DEUX 'sendMsg' vers
 //      la salle. Supprimé ici : la logique canonique 'follow' vit
 //      désormais uniquement dans followHandler.js.
-//
-// FIX (bug "enchère encore saisissable après refresh sur un lot déjà
-// vendu") :
-//   Le serveur relayait aveuglément toute enchère ('doEncheres', que ce
-//   soit émis directement ou routé via 'getMsgPrivate' — c'est ce second
-//   chemin qu'utilise réellement le formulaire de vente_list.php) sans
-//   jamais vérifier si le lot ciblé était encore ouvert aux enchères.
-//   Un refresh de page pendant qu'un lot vient d'être vendu/retiré (ou
-//   une requête forgée côté client) pouvait donc faire passer une
-//   enchère invalide.
-//
-//   On consulte désormais l'état du lot actif de la room (persisté par
-//   roomHandler.js à chaque 'numLot'/'closeEnchere' admin) AVANT tout
-//   relai d'enchère, quel que soit le chemin emprunté. Si le lot ciblé
-//   n'est pas le lot actif ou n'est pas ouvert, l'enchère est rejetée et
-//   un message 'enchereRefusee' est renvoyé au bidder à la place.
 
 const store = require("../store");
 const { log } = require("../utils/logger");
 const { getAdminOfRoom } = require("../services/roomService");
 const { updateSaleEndTimer } = require("../services/saleEndService");
-
-/**
- * Vérifie que le lot visé par une enchère est bien le lot actif de la room.
- * Retourne { ok: true } si l'enchère peut être relayée, ou
- * { ok: false, lotState } si elle doit être rejetée.
- */
-async function checkLotIsBiddable(room, lot) {
-  const lotState = await store.getLotState(room);
-
-  const ok =
-      !!lotState &&
-      lotState.active === true &&
-      String(lotState.numLot) === String(lot);
-
-  return { ok, lotState };
-}
-
-/**
- * Notifie le bidder que son enchère a été refusée (lot clos/inactif).
- */
-function emitEnchereRefusee(socket, lot, lotState) {
-  socket.emit("sendMsg", {
-    type: "enchereRefusee",
-    msg: {
-      lot,
-      reason: "lot_closed",
-      statut: lotState?.statut || null,
-    },
-    name: "system",
-    from: "server",
-  });
-}
 
 function registerBidderHandler(io, socket) {
   /**
@@ -145,20 +97,6 @@ function registerBidderHandler(io, socket) {
       name: meta?.pseudo || "unknown",
       from: socket.id,
     });
-
-    // ── FIX : renvoyer l'état du lot actif au bidder qui se reconnecte ──
-    // Complément côté affichage à la validation serveur ci-dessous : le
-    // client peut ainsi désactiver son propre formulaire tout de suite,
-    // sans attendre un nouvel événement numLot/closeEnchere de l'admin.
-    const lotState = await store.getLotState(room);
-    if (lotState) {
-      socket.emit("sendMsg", {
-        type: "lotState",
-        msg: lotState,
-        name: "system",
-        from: "server",
-      });
-    }
   });
 
   /**
@@ -204,26 +142,11 @@ function registerBidderHandler(io, socket) {
   /**
    * Enchère placée par un bidder.
    * socket.emit('doEncheres', { lot, myEnchere, room })
-   *
-   * NOTE : ce chemin direct n'est a priori plus utilisé par vente_list.php
-   * (qui passe par 'getMsgPrivate', voir plus bas), mais on applique la
-   * même validation ici par sécurité si un autre client l'utilise encore.
    */
   socket.on("doEncheres", async (data) => {
     const meta = await store.get(socket.id);
     const room = meta?.room || data?.room;
     if (!room) return;
-
-    // ── FIX : validation serveur avant relai de l'enchère ──────────────────
-    const { ok, lotState } = await checkLotIsBiddable(room, data?.lot);
-    if (!ok) {
-      log(
-          `  [enchère] REFUSÉE (lot clos/inactif) : ${socket.id} lot=${data?.lot} état=${JSON.stringify(lotState)}`,
-      );
-      emitEnchereRefusee(socket, data?.lot, lotState);
-      return;
-    }
-    // ─────────────────────────────────────────────────────────────────────
 
     log(
         `  [enchère]  : ${socket.id} lot=${data?.lot} montant=${data?.myEnchere}`,
@@ -250,12 +173,6 @@ function registerBidderHandler(io, socket) {
    *
    * C'est ici que transitent les numLot et listLot envoyés par l'admin
    * → on en profite pour mettre à jour le timer de fin de vente.
-   *
-   * C'est aussi ici que transite l'enchère du bidder envoyée par
-   * vente_list.php :
-   *   socket.emit("getMsgPrivate",{toid:idAdmin, type:'doEncheres', ...})
-   * → c'est donc ICI qu'il faut impérativement valider l'état du lot
-   * avant de relayer quoi que ce soit à l'admin (voir FIX plus bas).
    *
    * NOTE : ceci est désormais le SEUL listener 'getMsgPrivate' enregistré
    * (messageHandler.js a été vidé pour éviter le doublon — voir son en-tête).
@@ -311,47 +228,6 @@ function registerBidderHandler(io, socket) {
         log(
             `  [confirmEnchere] price absent → copié depuis myEnchere=${msg.price} lot=${msg.lot}`,
         );
-      }
-    }
-    // ──────────────────────────────────────────────────────────────────────
-
-    // ── FIX : persistance état du lot si numLot/closeEnchere transite ici ──
-    // (au cas où l'admin envoie ces types via getMsgPrivate plutôt que via
-    // getMsgRoom — on veut que l'état du lot soit fiable quel que soit le
-    // chemin utilisé par le client admin)
-    if (type === "numLot" && msg?.numLot !== undefined && room) {
-      await store.setLotState(room, {
-        numLot: msg.numLot,
-        active: msg.start === "ok",
-        statut: msg.statut || null,
-        price: msg.price ?? null,
-      });
-    }
-
-    if (type === "closeEnchere" && msg?.numLot !== undefined && room) {
-      await store.setLotState(room, {
-        numLot: msg.numLot,
-        active: false,
-        statut: msg.statut || "closed",
-        price: msg.price ?? null,
-      });
-    }
-    // ──────────────────────────────────────────────────────────────────────
-
-    // ── FIX : validation serveur de l'enchère avant relai à l'admin ────────
-    // C'est LE chemin réellement emprunté par le formulaire de
-    // vente_list.php. Sans ce contrôle, une enchère sur un lot déjà
-    // vendu/retiré était transmise telle quelle à l'admin, qui pouvait
-    // par erreur la valider (bug "enchère validée puis refusée" évoqué
-    // en tête de fichier), ou simplement afficher une incohérence.
-    if (type === "doEncheres") {
-      const { ok, lotState } = await checkLotIsBiddable(room, msg?.lot);
-      if (!ok) {
-        log(
-            `  [enchère] REFUSÉE (lot clos/inactif, via getMsgPrivate) : ${socket.id} lot=${msg?.lot} état=${JSON.stringify(lotState)}`,
-        );
-        emitEnchereRefusee(socket, msg?.lot, lotState);
-        return; // on n'envoie rien à l'admin
       }
     }
     // ──────────────────────────────────────────────────────────────────────

@@ -12,13 +12,6 @@ redis.on("connect", () => {
 
 const HASH_KEY = "socketMeta";
 
-// Hash Redis DÉDIÉ à l'état des lots (numéro de lot actif, ouvert/clos, prix)
-// par room. Volontairement SÉPARÉ de HASH_KEY (métadonnées des sockets) pour
-// ne pas être affecté par le cycle de vie des connexions socket ni par une
-// éventuelle routine de nettoyage qui suppose que chaque champ de HASH_KEY
-// correspond à un socket réellement connecté.
-const LOTS_HASH_KEY = "lotsState";
-
 const store = {
   /**
    * Enregistre ou met à jour les métadonnées d'un socket.
@@ -97,41 +90,6 @@ const store = {
   async getByRoom(room) {
     const all = await this.values();
     return all.filter((meta) => meta.room === room);
-  },
-
-  /**
-   * Enregistre/met à jour l'état du lot actif d'une room (numéro de lot,
-   * ouvert/clos, statut, prix). Stocké sur LOTS_HASH_KEY — Hash séparé de
-   * celui des sockets, donc jamais affecté par un disconnect/nettoyage de
-   * socket.
-   *
-   * @param {string} room
-   * @param {{numLot: string|number, active: boolean, statut: string|null, price: number|null}} state
-   */
-  async setLotState(room, state) {
-    if (!room) return;
-    const payload = { ...state, updatedAt: Date.now() };
-    await redis.hset(LOTS_HASH_KEY, room, JSON.stringify(payload));
-  },
-
-  /**
-   * Récupère l'état du lot actif d'une room.
-   * @param {string} room
-   * @returns {object|null}
-   */
-  async getLotState(room) {
-    if (!room) return null;
-    const raw = await redis.hget(LOTS_HASH_KEY, room);
-    return raw ? JSON.parse(raw) : null;
-  },
-
-  /**
-   * Supprime l'état de lot d'une room (ex: fin de vente / reset).
-   * @param {string} room
-   */
-  async deleteLotState(room) {
-    if (!room) return;
-    await redis.hdel(LOTS_HASH_KEY, room);
   },
 
   /**
