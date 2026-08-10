@@ -31,6 +31,22 @@
 //     (émettre 'userList' au socket après identification, pour que le
 //     bidder connaisse l'admin courant sans attendre un autre event) afin
 //     de ne perdre aucune fonctionnalité en supprimant le doublon.
+//
+//  FIX (bug "enchère encore saisissable après refresh sur un lot déjà
+//  vendu") :
+//  8. Le serveur n'avait AUCUNE notion de l'état du lot en cours — il se
+//     contentait de relayer aveuglément les messages admin (numLot,
+//     closeEnchere) et les enchères des bidders (voir bidderHandler.js).
+//     Résultat : rien n'empêchait, côté back, qu'une enchère soit acceptée
+//     sur un lot déjà clos si le client avait un affichage obsolète
+//     (formulaire encore visible après un refresh, ou requête forgée).
+//
+//     On persiste désormais l'état du lot actif de chaque room (numéro de
+//     lot, actif ou non, statut) dans le store partagé (Redis) à chaque
+//     'numLot' / 'closeEnchere' émis par l'admin via getMsgRoom. Cet état
+//     est exposé via getLotState()/setLotState() pour que bidderHandler.js
+//     puisse valider chaque enchère entrante AVANT de la relayer, quel que
+//     soit le chemin emprunté (getMsgRoom ou getMsgPrivate).
 // ─────────────────────────────────────────────────────────────────────────────
 
 const store = require("../store");
@@ -64,6 +80,40 @@ const ADMIN_ONLY_TYPES = new Set([
   "closeEnchere",
   "updateLot",
 ]);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FIX — ÉTAT DU LOT ACTIF PAR ROOM (persisté dans le store partagé)
+//
+// Clé : `lotstate:${room}` → { numLot, active, statut, price, updatedAt }
+//
+// - active = true  → le lot est ouvert aux enchères (numLot avec start="ok")
+// - active = false → le lot est clos (closeEnchere, ou numLot avec start!="ok")
+//
+// Utilisé par bidderHandler.js pour refuser toute enchère qui ne cible pas
+// le lot actuellement actif de la room.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function lotStateKey(room) {
+  return `lotstate:${room}`;
+}
+
+async function setLotState(room, state) {
+  if (!room) return;
+  await store.set(lotStateKey(room), {
+    ...state,
+    updatedAt: Date.now(),
+  });
+}
+
+async function getLotState(room) {
+  if (!room) return null;
+  try {
+    return await store.get(lotStateKey(room));
+  } catch (err) {
+    // Clé absente / erreur de lecture → aucun lot actif connu
+    return null;
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HISTORIQUE — ÉCRITURE ASYNCHRONE BUFFERISÉE
@@ -262,6 +312,21 @@ function registerRoomHandler(io, socket) {
       const adminId = await getAdminOfRoom(room);
       socket.emit("userList", { admin: adminId });
       log(`  [userList→${socket.id}] admin=${adminId || "none"}`);
+
+      // ── FIX : envoyer l'état du lot actif connu au bidder qui rejoint ──
+      // Utile si le bidder arrive/rafraîchit alors qu'un lot est déjà
+      // clos : son client saura tout de suite qu'il ne doit pas permettre
+      // de nouvelle enchère (en complément de la validation serveur qui,
+      // elle, est de toute façon appliquée dans bidderHandler.js).
+      const lotState = await getLotState(room);
+      if (lotState) {
+        socket.emit("sendMsg", {
+          type: "lotState",
+          msg: lotState,
+          name: "system",
+          from: "server",
+        });
+      }
     }
   });
 
@@ -345,6 +410,30 @@ function registerRoomHandler(io, socket) {
       return;
     }
 
+    // ── FIX : persistance de l'état du lot actif de la room ────────────────
+    // C'est la source de vérité que bidderHandler.js consultera avant de
+    // relayer/accepter une enchère. Sans ça, un refresh client au mauvais
+    // moment (ou une requête forgée) pouvait laisser passer une enchère
+    // sur un lot déjà vendu/retiré, faute de contrôle côté serveur.
+    if (data.type === "numLot" && data.msg?.numLot !== undefined) {
+      await setLotState(data.room, {
+        numLot: data.msg.numLot,
+        active: data.msg.start === "ok",
+        statut: data.msg.statut || null,
+        price: data.msg.price ?? null,
+      });
+    }
+
+    if (data.type === "closeEnchere" && data.msg?.numLot !== undefined) {
+      await setLotState(data.room, {
+        numLot: data.msg.numLot,
+        active: false,
+        statut: data.msg.statut || "closed",
+        price: data.msg.price ?? null,
+      });
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
     const payload = {
       type: data.type,
       msg: data.msg || {},
@@ -362,4 +451,9 @@ function registerRoomHandler(io, socket) {
   });
 }
 
-module.exports = { registerRoomHandler, flushHistoriqueSync };
+module.exports = {
+  registerRoomHandler,
+  flushHistoriqueSync,
+  getLotState,
+  setLotState,
+};
