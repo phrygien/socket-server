@@ -6,60 +6,41 @@
 // 'numLot'/'previousLot' à tout le monde en un seul emit (getMsgRoom, déjà
 // géré par roomHandler).
 //
-// Flux :
-//   screen.php se connecte en tant que "Screen_<timestamp>" (non-admin)
-//   → joinroom('auctav{sale_id}')   // ← même room que vente_list.php
-//   → username(pseudo)
-//   ← on('userList', { admin })
-//       → si admin présent  : affiche #all + envoie getScreen à l'admin
-//       → si admin absent   : cache #all
+// Flux réel de screen.php (inchangé) :
+//   connect → joinroom(room) → username(pseudo)
+//   ← userList({admin}) → si admin présent, screen.php appelle
+//     requestScreenInfos() qui émet :
+//       socket.emit("getMsgPrivate", {toid: idAdmin, type: 'getScreen', name})
+//   Ce 'getMsgPrivate' est relayé PRIVÉMENT à l'admin par messageHandler.js
+//   (non modifié ici). L'admin répond alors via maj_screen() → getMsgRoom
+//   'numLot' (broadcast room, géré par roomHandler.js, non modifié).
+//   screen.php répète requestScreenInfos() toutes les 3s (polling client déjà
+//   en place dans screen.php).
 //
-//   L'admin répond en broadcast sur la salle :
-//   ← on('sendMsg', { type: 'numLot',      msg: { numLot, nom, pere, mere,
-//                                                  presentateur, infos_suppl,
-//                                                  tva, from, img, prices[] } })
-//   ← on('sendMsg', { type: 'previousLot', msg: { numLot, prices[] } })
+// Problème réglé ici : sur un refresh de screen.php, l'écran reste vide
+// (valeurs par défaut "-") tant que l'admin n'a pas répondu à la demande
+// privée — délai visible, voire écran vide si l'admin est lent/absent.
 //
-// Côté serveur :
-//   - 'getScreen'   : le Screen demande à l'admin les infos du lot en cours
-//                     → relayé à toute la room de la vente (l'admin écoute et répond)
-//   - 'numLot'      : déjà géré par getMsgRoom dans roomHandler
-//   - 'previousLot' : déjà géré par getMsgRoom dans roomHandler
+// Solution — sans toucher à screen.php, messageHandler.js ni roomHandler.js :
+//   Socket.IO exécute TOUS les listeners enregistrés pour un même event.
+//   On ajoute donc ici un second listener 'getMsgPrivate', purement passif
+//   pour tout type autre que 'getScreen' (il ne fait rien et laisse
+//   messageHandler.js gérer normalement), et pour 'getScreen' il répond
+//   IMMÉDIATEMENT et en privé au socket demandeur avec le dernier état
+//   connu en cache (Redis, clé `lotstate:{room}`), sans bloquer ni modifier
+//   le relais habituel vers l'admin fait par messageHandler.js — qui
+//   continue en parallèle et peut renvoyer un état plus frais une fois
+//   l'admin réveillé/synchro.
 //
-// État en cache (nouveau) :
-//   Avant ce changement, un screen qui se connectait affichait "-" partout
-//   (valeurs par défaut du HTML) jusqu'à ce que l'admin réponde à son
-//   'getScreen' — délai visible, voire écran vide si l'admin est lent/absent.
-//
-//   Contrainte : impossible de modifier roomHandler.js. Or c'est LUI qui
-//   traite le 'getMsgRoom' émis par admin.php (maj_screen()) et broadcast
-//   le 'sendMsg'/'numLot' résultant — ce broadcast est une émission serveur
-//   → client, donc invisible à un simple socket.on() ailleurs... SAUF que
-//   Socket.IO autorise plusieurs listeners indépendants sur le MÊME event
-//   ('getMsgRoom') d'un même socket. roomHandler.js et ce fichier sont tous
-//   deux appelés à la connexion (registerRoomHandler + registerScreenHandler),
-//   donc les deux listeners 'getMsgRoom' coexistent et s'exécutent chacun de
-//   leur côté à chaque emit du client, sans interférence.
-//
-//   On ajoute donc ICI un second listener 'getMsgRoom', purement passif :
-//   il observe (sans jamais bloquer ni rien réémettre côté room) les
-//   messages de type 'numLot' et les met en cache Redis (`lotstate:{room}`).
-//   Une validation minimale (appartenance à la room) est dupliquée ici pour
-//   éviter de cacher un message qui serait de toute façon rejeté par
-//   roomHandler (socket hors room) — mais sans dupliquer le contrôle
-//   ADMIN_ONLY_TYPES : si un jour un non-admin réussit à émettre un faux
-//   'numLot' via getMsgRoom, roomHandler.js le bloque déjà avant broadcast,
-//   ce cache-ci resterait alors légèrement désynchronisé du "vrai" flux
-//   affiché aux autres clients — impact mineur (un screen affiche un état
-//   qui n'a jamais été diffusé aux autres), à surveiller si ça arrive.
-//
-//   Dès qu'un 'getScreen' est reçu (connexion du screen, ou polling
-//   périodique serveur), on répond IMMÉDIATEMENT en privé à l'expéditeur
-//   avec cet état caché, en plus du broadcast classique qui sollicite
-//   l'admin pour une éventuelle mise à jour plus fraîche.
+//   Le cache est alimenté par deux sources, toutes deux déjà en place :
+//     - 'numLot' direct (switcher) → écouté ici directement
+//     - 'numLot' via getMsgRoom (admin/maj_screen) → écouté ici en
+//       parallèle du listener de roomHandler.js, en lecture seule
 //
 //   screen.php n'a besoin d'AUCUNE modification : il reçoit ce payload
-//   caché via le même canal 'sendMsg'/type:'numLot' que d'habitude.
+//   caché via le même canal 'sendMsg'/type:'numLot' que d'habitude, donc
+//   son handler afficheLot() existant l'affiche normalement, dès la
+//   connexion/refresh, sans attendre l'admin.
 //
 // Adaptation clustering (Redis store) :
 //   store.get()/entries()/set() sont asynchrones (Redis). Tous les
@@ -102,15 +83,46 @@ async function getCachedLotState(room) {
 
 function registerScreenHandler(io, socket) {
   /**
-   * Le Screen demande les données du lot courant.
-   * Émis juste après réception de userList({ admin }), ou par le
-   * polling serveur périodique.
+   * Listener PASSIF sur 'getMsgPrivate' — coexiste avec celui de
+   * messageHandler.js (non modifié), sans jamais toucher au relais
+   * privé vers l'admin qu'il effectue déjà.
    *
-   * Comportement :
-   *   1. Si un état est en cache pour cette room, on le renvoie
-   *      IMMÉDIATEMENT et en privé au socket demandeur (le screen).
-   *   2. On broadcast quand même 'getScreen' à toute la room, pour
-   *      que l'admin puisse répondre avec un état plus à jour.
+   * Ne s'active que pour type === 'getScreen' (la demande que screen.php
+   * émet à chaque connexion/refresh et toutes les 3s). Dès réception,
+   * répond IMMÉDIATEMENT en privé (socket.emit, jamais de broadcast room)
+   * à l'expéditeur avec le dernier état connu en cache, s'il existe.
+   *
+   * C'est ce qui règle le refresh : screen.php n'a rien à changer, il
+   * reçoit ce payload via son handler `sendMsg`/`type:"numLot"` existant,
+   * avant même que l'admin n'ait eu le temps de répondre à la demande
+   * privée relayée en parallèle par messageHandler.js.
+   */
+  socket.on("getMsgPrivate", async (data) => {
+    if (!data || data.type !== "getScreen") return;
+
+    const meta = await store.get(socket.id);
+    const room = meta?.room;
+    if (!room) return;
+
+    const cached = await getCachedLotState(room);
+    if (!cached) return;
+
+    log(`  [getMsgPrivate→cache hit] getScreen ${socket.id} → réponse immédiate (room=${room})`);
+
+    socket.emit("sendMsg", {
+      type: "numLot",
+      msg: cached,
+      name: "System",
+      from: null,
+    });
+  });
+
+  /**
+   * Le Screen (ou tout autre client) peut aussi demander l'état via un
+   * 'getScreen' broadcast direct (utilisé par le polling serveur
+   * ci-dessous). Même logique : réponse immédiate depuis le cache si
+   * disponible, puis broadcast classique pour solliciter une réponse
+   * plus fraîche de l'admin/switcher.
    */
   socket.on("getScreen", async (data) => {
     const meta = await store.get(socket.id);
@@ -182,23 +194,20 @@ function registerScreenHandler(io, socket) {
 
   /**
    * Listener PASSIF sur 'getMsgRoom' — coexiste avec celui de
-   * roomHandler.js sans le modifier ni le remplacer (Socket.IO exécute
-   * tous les listeners enregistrés pour un même event). But unique :
+   * roomHandler.js sans le modifier ni le remplacer. But unique :
    * capter les 'numLot' que l'admin envoie via getMsgRoom (le chemin
    * "normal" documenté dans admin.php/maj_screen()) pour les mettre en
-   * cache, exactement comme le fait le listener 'numLot' direct ci-dessus
-   * pour le switcher.
+   * cache, exactement comme le fait le listener 'numLot' direct pour
+   * le switcher.
    *
-   * Ne réémet RIEN, ne bloque RIEN : lecture seule, effet de bord = cache
-   * uniquement. roomHandler.js garde l'entière responsabilité de la
-   * validation et du broadcast réel du message.
+   * Ne réémet RIEN, ne bloque RIEN : lecture seule, effet de bord =
+   * cache uniquement. roomHandler.js garde l'entière responsabilité de
+   * la validation et du broadcast réel du message.
    */
   socket.on("getMsgRoom", async (data) => {
     if (!data || data.type !== "numLot") return;
     if (typeof data.room !== "string" || !data.room.trim()) return;
 
-    // Validation minimale dupliquée (appartenance à la room) pour éviter
-    // de cacher un message qui sera de toute façon rejeté par roomHandler.
     if (!socket.rooms.has(data.room)) return;
 
     log(`  [getMsgRoom→cache] numLot lot=${data.msg?.numLot} room=${data.room}`);
@@ -233,11 +242,8 @@ async function getScreensInRoom(room) {
  * Relance périodique server-side : pour chaque room de vente
  * ("auctav{sale_id}") contenant au moins un écran ("Screen_*") connecté,
  * diffuse un 'getScreen' à toute la room, toutes les POLL_INTERVAL_MS.
- *
- * Combiné au cache lotstate, ça garantit que même un screen qui vient
- * de rejoindre la room affichera l'état courant sans délai perceptible,
- * dès son premier 'getScreen' (déclenché juste après userList côté
- * client screen.php).
+ * Complémentaire au flux normal de screen.php (qui interroge en privé
+ * via getMsgPrivate toutes les 3s) — filet de sécurité supplémentaire.
  */
 function startScreenPolling(io) {
   setInterval(async () => {
