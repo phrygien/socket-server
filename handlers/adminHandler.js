@@ -1,7 +1,20 @@
 // ─── Admin Handler ────────────────────────────────────────────────────────────
 // Événements émis par switcher.php
 //
-// Correctif ajouté :
+// SÉCURITÉ :
+//   L'event 'admin' exige la clé ADMIN_KEY en 2ᵉ argument :
+//       socket.emit("admin", pseudo, ADMIN_KEY, (res) => { /* res.ok */ })
+//   Le 3ᵉ argument (callback) est optionnel : il reçoit { ok: true|false }.
+//   Le client peut ainsi n'émettre 'joinroom' qu'APRÈS la validation de
+//   l'admin, ce qui évite que 'admin' et 'joinroom' (deux lectures/écritures
+//   concurrentes du même meta Redis) s'écrasent mutuellement.
+//   La clé est écrite par switcher.php (page réservée aux admins connectés)
+//   et vérifiée ici en temps constant. Un client qui se déclare admin depuis
+//   la console sans connaître la clé est refusé, et déconnecté après
+//   MAX_ADMIN_FAILS tentatives. Si ADMIN_KEY n'est pas configurée, aucun
+//   admin n'est accepté (fail closed).
+//
+// Correctif existant :
 //   Si l'event 'admin' arrive alors que le socket est DÉJÀ dans une room
 //   (ex: reconnexion qui rejoue 'joinroom' puis 'admin' dans un ordre
 //   différent, ou ré-émission de 'admin' sans nouveau 'joinroom'), on
@@ -27,22 +40,52 @@
 //   roomHandler.js pour l'amélioration possible (Pub/Sub ciblé).
 
 const store = require("../store");
+const { ADMIN_KEY } = require("../config");
+const safeEqual = require("../utils/safeEqual");
 const { log } = require("../utils/logger");
 const {
   broadcastUserList,
   getAdminOfRoom,
 } = require("../services/roomService");
 
+const MAX_ADMIN_FAILS = 3;
+
 function registerAdminHandler(io, socket) {
   /**
    * Identification de l'admin — émis avant joinroom.
    * socket.emit('admin', pseudo)
    */
-  socket.on("admin", async (pseudo) => {
+  socket.on("admin", async (pseudo, key, ack) => {
+    const done = (ok) => {
+      if (typeof ack === "function") ack({ ok });
+    };
+
+    // ── Contrôle d'autorisation : clé admin obligatoire ──
+    if (!ADMIN_KEY) {
+      log(`  [admin]    : REFUSÉ – ADMIN_KEY non configurée (${socket.id})`);
+      done(false);
+      return;
+    }
+
+    if (typeof key !== "string" || !safeEqual(key, ADMIN_KEY)) {
+      socket.data.adminFails = (socket.data.adminFails || 0) + 1;
+      log(
+          `  [admin]    : REFUSÉ – clé invalide (${socket.data.adminFails}/${MAX_ADMIN_FAILS}) socket=${socket.id}`,
+      );
+      done(false);
+      if (socket.data.adminFails >= MAX_ADMIN_FAILS) socket.disconnect(true);
+      return;
+    }
+
+    const cleanPseudo =
+        typeof pseudo === "string" && pseudo.trim()
+            ? pseudo.trim().slice(0, 50)
+            : "Admin";
+
     const meta = await store.get(socket.id);
 
     if (meta) {
-      meta.pseudo = pseudo || "Admin";
+      meta.pseudo = cleanPseudo;
       meta.isAdmin = true;
 
       // Si ce socket est déjà dans une room (reconnexion rapide, ou 'admin'
@@ -54,12 +97,12 @@ function registerAdminHandler(io, socket) {
           const oldSocket = io.sockets.sockets.get(existingAdminId);
           if (oldSocket) {
             log(
-              `  [ADMIN REPLACE] (via 'admin' event) ancien admin=${existingAdminId} expulsé de room="${meta.room}" (remplacé par ${socket.id})`,
+                `  [ADMIN REPLACE] (via 'admin' event) ancien admin=${existingAdminId} expulsé de room="${meta.room}" (remplacé par ${socket.id})`,
             );
             oldSocket.disconnect(true); // ferme proprement → déclenche disconnectHandler
           } else {
             log(
-              `  [ADMIN REPLACE] (via 'admin' event) ancien admin=${existingAdminId} déjà fantôme (ou sur une autre instance), nettoyage direct du store`,
+                `  [ADMIN REPLACE] (via 'admin' event) ancien admin=${existingAdminId} déjà fantôme (ou sur une autre instance), nettoyage direct du store`,
             );
             await store.delete(existingAdminId);
           }
@@ -69,10 +112,12 @@ function registerAdminHandler(io, socket) {
       await store.set(socket.id, meta);
     }
 
-    log(`  [admin]    : ${socket.id} → "${pseudo}"`);
+    log(`  [admin]    : ${socket.id} → "${cleanPseudo}"`);
 
     // Si l'admin était déjà dans une salle (reconnexion rapide), notifier
     if (meta?.room) await broadcastUserList(io, meta.room);
+
+    done(true);
   });
 }
 

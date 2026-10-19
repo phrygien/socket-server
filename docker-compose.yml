@@ -27,6 +27,11 @@ services:
       - PORT=${APP_PORT}
       - INSTANCE_ID=app1
       - REDIS_URL=redis://redis:6379
+      # Clé admin : doit être IDENTIQUE à ADMIN_KEY_SOCKET dans config.inc.php (PHP).
+      # Le démarrage échoue si elle est absente du .env.
+      - ADMIN_KEY=${ADMIN_KEY:?ADMIN_KEY manquant dans le fichier .env}
+      # Clé des routes de debug (/follow/:room, /screen/:room). Vide = routes désactivées.
+      - DEBUG_KEY=${DEBUG_KEY:-}
     networks:
       - auctav-internal
       - traefik-public
@@ -62,6 +67,8 @@ services:
       - PORT=${APP_PORT}
       - INSTANCE_ID=app2
       - REDIS_URL=redis://redis:6379
+      - ADMIN_KEY=${ADMIN_KEY:?ADMIN_KEY manquant dans le fichier .env}
+      - DEBUG_KEY=${DEBUG_KEY:-}
     networks:
       - auctav-internal
       - traefik-public
@@ -80,6 +87,8 @@ services:
       - PORT=${APP_PORT}
       - INSTANCE_ID=app3
       - REDIS_URL=redis://redis:6379
+      - ADMIN_KEY=${ADMIN_KEY:?ADMIN_KEY manquant dans le fichier .env}
+      - DEBUG_KEY=${DEBUG_KEY:-}
     networks:
       - auctav-internal
       - traefik-public
@@ -98,6 +107,8 @@ services:
       - PORT=${APP_PORT}
       - INSTANCE_ID=app4
       - REDIS_URL=redis://redis:6379
+      - ADMIN_KEY=${ADMIN_KEY:?ADMIN_KEY manquant dans le fichier .env}
+      - DEBUG_KEY=${DEBUG_KEY:-}
     networks:
       - auctav-internal
       - traefik-public

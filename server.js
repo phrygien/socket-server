@@ -1,6 +1,12 @@
 /**
  * Serveur Socket.IO — Auctav Live Sales
  * VERSION CLUSTERISÉE — Docker + Traefik + Redis adapter (multi-instances)
+ *
+ * Sécurité :
+ *  1. allowRequest  : seules les origines de ALLOWED_ORIGINS peuvent ouvrir un socket
+ *  2. rate limiting par IP (local à l'instance)
+ *  3. event "admin" protégé par ADMIN_KEY (voir handlers/adminHandler.js)
+ *  4. routes de debug protégées par l'en-tête x-debug-key
  */
 
 const express = require("express");
@@ -9,9 +15,10 @@ const { Server } = require("socket.io");
 const { createAdapter } = require("@socket.io/redis-adapter");
 const Redis = require("ioredis");
 
-const { PORT } = require("./config");
+const { PORT, ALLOWED_ORIGINS, ADMIN_KEY, DEBUG_KEY } = require("./config");
 const store = require("./store");
 const { log } = require("./utils/logger");
+const safeEqual = require("./utils/safeEqual");
 
 const { getRoomStats } = require("./services/roomService");
 
@@ -40,17 +47,35 @@ const server = http.createServer(app);
 
 app.use(express.json());
 
+/**
+ * Routes de debug : désactivées (404) si DEBUG_KEY est vide ou si
+ * l'en-tête x-debug-key ne correspond pas.
+ */
+function requireDebugKey(req, res, next) {
+  const given = req.get("x-debug-key");
+  if (!DEBUG_KEY || !given || !safeEqual(given, DEBUG_KEY)) {
+    return res.status(404).json({ error: "Not found" });
+  }
+  next();
+}
+
 // ─────────────────────────────────────────────────────────────
-// CORS
+// UTILITAIRES
 // ─────────────────────────────────────────────────────────────
 
-const ALLOWED_ORIGINS = [
-  "https://www.auctav.com",
-  "https://auctav.com",
-  "https://socket-auctav.astucom.com",
-  "http://localhost",
-  "http://127.0.0.1",
-];
+/**
+ * IP du client : premier élément de x-forwarded-for (derrière Traefik),
+ * sinon adresse de la connexion.
+ */
+function getClientIp(headers, address) {
+  const forwarded = headers["x-forwarded-for"];
+  if (forwarded) return String(forwarded).split(",")[0].trim();
+  return address || "unknown";
+}
+
+function isOriginAllowed(origin) {
+  return typeof origin === "string" && ALLOWED_ORIGINS.includes(origin);
+}
 
 // ─────────────────────────────────────────────────────────────
 // RATE LIMITING PAR IP
@@ -99,16 +124,16 @@ app.get("/", async (_req, res) => {
   });
 });
 
-// Followers debug
-app.get("/follow/:room", async (req, res) => {
+// Followers debug (protégé)
+app.get("/follow/:room", requireDebugKey, async (req, res) => {
   res.json({
     room: req.params.room,
     followers: await getFollowersInRoom(req.params.room),
   });
 });
 
-// Screens debug
-app.get("/screen/:room", async (req, res) => {
+// Screens debug (protégé)
+app.get("/screen/:room", requireDebugKey, async (req, res) => {
   res.json({
     room: req.params.room,
     screens: await getScreensInRoom(req.params.room),
@@ -141,21 +166,28 @@ const io = new Server(server, {
   // polling + websocket
   transports: ["polling", "websocket"],
 
+  // ───────────────────────────────────────────────────
+  // BLOCAGE SERVEUR DES ORIGINES NON AUTORISÉES
+  //
+  // Exécuté AVANT la création du socket, pour chaque requête de handshake
+  // (polling ET upgrade WebSocket). Une requête sans en-tête Origin est refusée.
+  // ───────────────────────────────────────────────────
+  allowRequest: (req, callback) => {
+    const origin = req.headers.origin;
+
+    if (isOriginAllowed(origin)) {
+      return callback(null, true);
+    }
+
+    const ip = getClientIp(req.headers, req.socket.remoteAddress);
+    log(`[ORIGIN BLOQUÉE] origin=${origin || "(aucune)"} ip=${ip}`);
+
+    return callback("Origin not allowed", false);
+  },
+
+  // CORS (navigateurs) — même liste, sans exception pour les requêtes sans Origin
   cors: {
-    origin: function (origin, callback) {
-      if (!origin) {
-        return callback(null, true);
-      }
-
-      if (ALLOWED_ORIGINS.includes(origin)) {
-        return callback(null, true);
-      }
-
-      log(`CORS bloqué : ${origin}`);
-
-      return callback(new Error("CORS blocked"));
-    },
-
+    origin: ALLOWED_ORIGINS,
     methods: ["GET", "POST"],
     credentials: true,
   },
@@ -177,23 +209,30 @@ const pubClient = new Redis(process.env.REDIS_URL || "redis://redis:6379");
 const subClient = pubClient.duplicate();
 
 pubClient.on("error", (err) =>
-  log(`[REDIS ADAPTER] Erreur pubClient : ${err.message}`),
+    log(`[REDIS ADAPTER] Erreur pubClient : ${err.message}`),
 );
 subClient.on("error", (err) =>
-  log(`[REDIS ADAPTER] Erreur subClient : ${err.message}`),
+    log(`[REDIS ADAPTER] Erreur subClient : ${err.message}`),
 );
 
 io.adapter(createAdapter(pubClient, subClient));
 
 log(
-  `[REDIS ADAPTER] Adapter Socket.IO branché sur ${process.env.REDIS_URL || "redis://redis:6379"}`,
+    `[REDIS ADAPTER] Adapter Socket.IO branché sur ${process.env.REDIS_URL || "redis://redis:6379"}`,
 );
 
 // ─────────────────────────────────────────────────────────────
+// MIDDLEWARE : rate limit + création de l'entrée store
+//
+// L'entrée store (pseudo/room/isAdmin) est créée ICI, avant l'event
+// 'connection', afin que les handlers puissent être enregistrés de façon
+// synchrone dans io.on('connection'). Avant, un `await store.set()` placé
+// avant l'enregistrement des handlers faisait perdre les events émis par le
+// client immédiatement après la connexion.
+// ─────────────────────────────────────────────────────────────
 
-io.use((socket, next) => {
-  const ip =
-    socket.handshake.headers["x-forwarded-for"] || socket.handshake.address;
+io.use(async (socket, next) => {
+  const ip = getClientIp(socket.handshake.headers, socket.handshake.address);
 
   const count = connPerIP.get(ip) || 0;
 
@@ -204,9 +243,30 @@ io.use((socket, next) => {
 
   connPerIP.set(ip, count + 1);
 
-  socket.on("disconnect", () => {
+  const release = () => {
     const n = (connPerIP.get(ip) || 1) - 1;
     n <= 0 ? connPerIP.delete(ip) : connPerIP.set(ip, n);
+  };
+
+  try {
+    await store.set(socket.id, {
+      pseudo: "unknown",
+      room: null,
+      isAdmin: false,
+    });
+  } catch (err) {
+    release();
+    log(`[STORE] Erreur création entrée ${socket.id} : ${err.message}`);
+    return next(new Error("Server error"));
+  }
+
+  socket.on("disconnect", () => {
+    release();
+    // Si le socket est parti avant d'atteindre 'connection', disconnectHandler
+    // n'existe pas pour lui → on nettoie l'entrée store ici.
+    if (!socket.data.connected) {
+      store.delete(socket.id).catch(() => {});
+    }
   });
 
   next();
@@ -214,16 +274,13 @@ io.use((socket, next) => {
 
 // ─────────────────────────────────────────────────────────────
 // SOCKET CONNECTION
+// (synchrone : tous les handlers sont enregistrés immédiatement)
 // ─────────────────────────────────────────────────────────────
 
-io.on("connection", async (socket) => {
-  log(`+ Connexion : ${socket.id}`);
+io.on("connection", (socket) => {
+  socket.data.connected = true;
 
-  await store.set(socket.id, {
-    pseudo: "unknown",
-    room: null,
-    isAdmin: false,
-  });
+  log(`+ Connexion : ${socket.id}`);
 
   // ───────────────────────────────────────────────────
   // DEBUG TRANSPORT
@@ -267,8 +324,12 @@ io.on("connection", async (socket) => {
 server.listen(PORT, () => {
   log(`Socket.IO server démarré sur port ${PORT}`);
   log(
-    `Mode : PRODUCTION (clusterisé, instance=${process.env.INSTANCE_ID || "unknown"})`,
+      `Mode : PRODUCTION (clusterisé, instance=${process.env.INSTANCE_ID || "unknown"})`,
   );
+  log(`Origines autorisées : ${ALLOWED_ORIGINS.join(", ")}`);
+  if (!ADMIN_KEY) {
+    log("[ADMIN] ATTENTION : ADMIN_KEY non défini — aucun admin ne pourra se connecter");
+  }
   log(`Health : http://localhost:${PORT}/`);
 });
 
