@@ -90,24 +90,32 @@ services:
     container_name: auctav-app1
     cpuset: "0"
     environment: { <<: *app-env, INSTANCE_ID: app1 }
+    volumes:
+      - ./data/historique-app1.json:/app/historique.json
 
   app2:
     <<: *app
     container_name: auctav-app2
     cpuset: "1"
     environment: { <<: *app-env, INSTANCE_ID: app2 }
+    volumes:
+      - ./data/historique-app2.json:/app/historique.json
 
   app3:
     <<: *app
     container_name: auctav-app3
     cpuset: "2"
     environment: { <<: *app-env, INSTANCE_ID: app3 }
+    volumes:
+      - ./data/historique-app3.json:/app/historique.json
 
   app4:
     <<: *app
     container_name: auctav-app4
     cpuset: "3"
     environment: { <<: *app-env, INSTANCE_ID: app4 }
+    volumes:
+      - ./data/historique-app4.json:/app/historique.json
 
 networks:
   auctav-internal:
